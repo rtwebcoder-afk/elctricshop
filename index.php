@@ -3,28 +3,50 @@ require_once 'connection.php'; // Database connection file
 
 $message = "";
 
-// 1. Store se tamam items fetch karna (Accessories Dropdown ke liye)
+// 1. Store se tamam items fetch karna
 $store_items = [];
 try {
     $stmt = $pdo->query("SELECT * FROM store_items ORDER BY item_name ASC");
     $store_items = $stmt->fetchAll(PDO::FETCH_ASSOC);
 } catch (Exception $e) {
-    // Agar store_items table na bana ho to error handle karein
+    // Handling error if table missing
 }
 
-// 2. Form Submit hone par Data Save aur Redirect karna
+// 2. Form Submit hone par Data Save aur Stock Deduct karna
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
     $name  = htmlspecialchars(trim($_POST['name'] ?? ''));
     $date  = htmlspecialchars(trim($_POST['date'] ?? ''));
     $fault = htmlspecialchars(trim($_POST['fault'] ?? ''));
     
-    // Multiple Selected Accessories ko Combine karna (e.g., "Wire, Breaker, Frame")
-    $accessories_array = $_POST['accessories'] ?? [];
-    if (is_array($accessories_array)) {
-        $accessories = htmlspecialchars(implode(', ', $accessories_array));
-    } else {
-        $accessories = htmlspecialchars($accessories_array);
+    // Process Selected Accessories with Quantities
+    $selected_items = $_POST['items'] ?? []; 
+    $quantities     = $_POST['qty'] ?? [];   
+
+    $accessories_formatted_list = [];
+    $items_to_deduct = [];
+
+    if (is_array($selected_items)) {
+        foreach ($selected_items as $item_id) {
+            $qty = filter_var($quantities[$item_id] ?? 1, FILTER_VALIDATE_INT) ?: 1;
+
+            // Fetch Item Name & Check Current Stock
+            $stmt_item = $pdo->prepare("SELECT item_name, quantity FROM store_items WHERE id = :id");
+            $stmt_item->execute([':id' => $item_id]);
+            $fetched_item = $stmt_item->fetch(PDO::FETCH_ASSOC);
+
+            if ($fetched_item) {
+                $item_name = $fetched_item['item_name'];
+                $accessories_formatted_list[] = $item_name . " (x" . $qty . ")";
+                
+                $items_to_deduct[] = [
+                    'id'  => $item_id,
+                    'qty' => $qty
+                ];
+            }
+        }
     }
+
+    $accessories = htmlspecialchars(implode(', ', $accessories_formatted_list));
 
     $note      = htmlspecialchars(trim($_POST['note'] ?? ''));
     $amount    = filter_var($_POST['amount'], FILTER_VALIDATE_FLOAT) ?: 0.00;
@@ -32,31 +54,53 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     $remaining = $amount - $advance;
 
     if (!empty($name) && !empty($date) && !empty($fault)) {
-        // Database me Insert SQL Query
-        $sql = "INSERT INTO service_entries (customer_name, entry_date, fault, accessories, note, amount, advance, remaining) 
-                VALUES (:name, :date, :fault, :accessories, :note, :amount, :advance, :remaining)";
-        
-        $stmt = $pdo->prepare($sql);
-        $saved = $stmt->execute([
-            ':name'        => $name, 
-            ':date'        => $date, 
-            ':fault'       => $fault, 
-            ':accessories' => $accessories, 
-            ':note'        => $note, 
-            ':amount'      => $amount, 
-            ':advance'     => $advance, 
-            ':remaining'   => $remaining
-        ]);
+        try {
+            // Transaction Start (Database Safety)
+            $pdo->beginTransaction();
 
-        if ($saved) {
-            // Nayi save hui entry ka ID haasil karein
+            // 1. Insert into service_entries
+            $sql = "INSERT INTO service_entries (customer_name, entry_date, fault, accessories, note, amount, advance, remaining) 
+                    VALUES (:name, :date, :fault, :accessories, :note, :amount, :advance, :remaining)";
+            
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([
+                ':name'        => $name, 
+                ':date'        => $date, 
+                ':fault'       => $fault, 
+                ':accessories' => $accessories, 
+                ':note'        => $note, 
+                ':amount'      => $amount, 
+                ':advance'     => $advance, 
+                ':remaining'   => $remaining
+            ]);
+
             $last_id = $pdo->lastInsertId();
 
-            // Direct show.php par redirect karein ID ke sath
+            // 2. Deduct Stock from store_items
+            if (!empty($items_to_deduct)) {
+                $update_stock_sql = "UPDATE store_items SET quantity = GREATEST(0, quantity - :qty) WHERE id = :id";
+                $stmt_stock = $pdo->prepare($update_stock_sql);
+
+                foreach ($items_to_deduct as $deduct) {
+                    $stmt_stock->execute([
+                        ':qty' => $deduct['qty'],
+                        ':id'  => $deduct['id']
+                    ]);
+                }
+            }
+
+            // Commit Transaction
+            $pdo->commit();
+
+            // Direct show.php par redirect
             header("Location: show.php?id=" . $last_id);
             exit;
-        } else {
-            $message = "Error: Record save nahi ho saka!";
+
+        } catch (Exception $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            $message = "Error: Record save nahi ho saka! (" . $e->getMessage() . ")";
         }
     } else {
         $message = "Barah-e-karam tamam zaroori fields (Name, Date, Fault) pur karein!";
@@ -75,16 +119,41 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     <!-- Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
-        // Accessories ki price calculate karke Total Amount me add karne ka function
-        function calculateAccessoriesTotal() {
-            const selectElement = document.getElementById('accessories');
-            let totalAccessoriesPrice = 0;
+        // Quantity Plus/Minus Controls
+        function changeQty(itemId, change) {
+            const qtyInput = document.getElementById('qty_' + itemId);
+            const checkbox = document.getElementById('item_check_' + itemId);
+            if (!qtyInput) return;
 
-            // Handlers for selected options
-            for (let option of selectElement.selectedOptions) {
-                const price = parseFloat(option.getAttribute('data-price')) || 0;
-                totalAccessoriesPrice += price;
+            let currentVal = parseInt(qtyInput.value) || 1;
+            let maxVal = parseInt(qtyInput.getAttribute('max')) || 9999;
+            let newVal = currentVal + change;
+
+            if (newVal >= 1 && newVal <= maxVal) {
+                qtyInput.value = newVal;
+                
+                // Item select na ho to auto-check kar dein
+                if (checkbox && !checkbox.checked) {
+                    checkbox.checked = true;
+                }
+                
+                calculateAccessoriesTotal();
             }
+        }
+
+        // Accessories ki price (Price x Quantity) Calculate karne ka function
+        function calculateAccessoriesTotal() {
+            let totalAccessoriesPrice = 0;
+            const checkboxes = document.querySelectorAll('.item-checkbox:checked');
+
+            checkboxes.forEach(cb => {
+                const itemId = cb.value;
+                const price = parseFloat(cb.getAttribute('data-price')) || 0;
+                const qtyInput = document.getElementById('qty_' + itemId);
+                const qty = parseInt(qtyInput ? qtyInput.value : 1) || 1;
+
+                totalAccessoriesPrice += (price * qty);
+            });
 
             // Set Total Amount Field
             document.getElementById('amount').value = totalAccessoriesPrice.toFixed(2);
@@ -93,7 +162,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             calculateRemaining();
         }
 
-        // Automatic Remaining Amount Calculate karne ke liye JavaScript function
+        // Automatic Remaining Amount Calculate karne ka function
         function calculateRemaining() {
             const amount = parseFloat(document.getElementById('amount').value) || 0;
             const advance = parseFloat(document.getElementById('advance').value) || 0;
@@ -104,30 +173,23 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
 </head>
 <body class="bg-slate-100 min-h-screen py-8 px-4 flex items-center justify-center">
 
-   <div class="max-w-2xl w-full bg-white rounded-2xl shadow-xl overflow-hidden border border-slate-200">
+    <div class="max-w-2xl w-full bg-white rounded-2xl shadow-xl overflow-hidden border border-slate-200">
         
-    <!-- Header Section with Logo & Store Button -->
-    <div class="bg-gradient-to-r from-blue-50 to-orange-50 p-6 border-b border-slate-200 relative">
-        <div class="grid grid-cols-3 items-center mb-2">
-            <!-- Left Column (Empty balance spacer) -->
-            <div></div>
-
-            <!-- Center Logo -->
-            <div class="flex justify-center">
-                <img src="logo.jpeg" alt="FS Solar Logo" class="h-24 object-contain" onError="this.onerror=null; this.src='https://via.placeholder.com/200x80?text=FS+Solar';" />
+        <!-- Header Section with Logo & Store Button -->
+        <div class="bg-gradient-to-r from-blue-50 to-orange-50 p-6 border-b border-slate-200 relative">
+            <div class="grid grid-cols-3 items-center mb-2">
+                <div></div>
+                <div class="flex justify-center">
+                    <img src="logo.jpeg" alt="FS Solar Logo" class="h-24 object-contain" onError="this.onerror=null; this.src='https://via.placeholder.com/200x80?text=FS+Solar';" />
+                </div>
+                <div class="flex justify-end">
+                    <a href="store.php" class="bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold py-2 px-3 rounded-lg shadow transition flex items-center gap-1">
+                        🛒 <span>Manage Store</span>
+                    </a>
+                </div>
             </div>
-
-            <!-- Right Column (Store Navigation Button) -->
-            <div class="flex justify-end">
-                <a href="store.php" class="bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold py-2 px-3 rounded-lg shadow transition flex items-center gap-1">
-                    🛒 <span>Manage Store</span>
-                </a>
-            </div>
+            <p class="text-xs text-center tracking-wider text-slate-500 uppercase font-semibold">Energy & Security Solution</p>
         </div>
-
-        <!-- Tagline -->
-        <p class="text-xs text-center tracking-wider text-slate-500 uppercase font-semibold">Energy & Security Solution</p>
-    </div>
 
         <!-- Notification / Warning Message -->
         <?php if (!empty($message)): ?>
@@ -163,26 +225,78 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                     class="w-full px-4 py-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition"></textarea>
             </div>
 
-            <!-- Accessories Field (Dynamic Dropdown from Database) -->
+            <!-- Accessories Section with Quantity Selector -->
             <div>
-                <div class="flex justify-between items-center mb-1">
-                    <label for="accessories" class="block text-sm font-semibold text-slate-700">Accessories</label>
-                    <span class="text-xs text-slate-400">Ctrl / Cmd daba kar ek se zayada chun sakte hain</span>
+                <div class="flex justify-between items-center mb-2">
+                    <label class="block text-sm font-semibold text-slate-700">Select Accessories & Quantities</label>
+                    <span class="text-xs text-slate-400">Items select karein aur quantity set karein</span>
                 </div>
-                <!-- Added onchange event for Auto Calculation -->
-                <select id="accessories" name="accessories[]" multiple size="4" onchange="calculateAccessoriesTotal()" 
-                    class="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition bg-white">
+
+                <div class="max-h-60 overflow-y-auto border border-slate-300 rounded-lg divide-y divide-slate-100 bg-slate-50/50 p-2">
                     <?php if (!empty($store_items)): ?>
-                        <?php foreach ($store_items as $item): ?>
-                            <!-- data-price attribute pass kiya gaya hai JS calculation ke liye -->
-                            <option value="<?php echo htmlspecialchars($item['item_name']); ?>" data-price="<?php echo htmlspecialchars($item['item_price']); ?>" class="py-1 px-2 border-b border-slate-100">
-                                <?php echo htmlspecialchars($item['item_name']); ?> (Rs. <?php echo number_format($item['item_price'], 2); ?>)
-                            </option>
+                        <?php foreach ($store_items as $item): 
+                            $stock = (int)($item['quantity'] ?? 0);
+                            $isOutOfStock = $stock <= 0;
+                        ?>
+                            <div class="flex items-center justify-between p-2 rounded-lg hover:bg-white transition <?php echo $isOutOfStock ? 'opacity-50' : ''; ?>">
+                                
+                                <!-- Checkbox & Details -->
+                                <div class="flex items-center gap-3">
+                                    <input type="checkbox" 
+                                           name="items[]" 
+                                           id="item_check_<?php echo $item['id']; ?>" 
+                                           value="<?php echo $item['id']; ?>" 
+                                           data-price="<?php echo $item['item_price']; ?>"
+                                           onchange="calculateAccessoriesTotal()"
+                                           <?php echo $isOutOfStock ? 'disabled' : ''; ?>
+                                           class="item-checkbox w-4 h-4 text-blue-600 rounded focus:ring-blue-500 cursor-pointer">
+                                    
+                                    <div>
+                                        <label for="item_check_<?php echo $item['id']; ?>" class="text-sm font-semibold text-slate-800 cursor-pointer">
+                                            <?php echo htmlspecialchars($item['item_name']); ?>
+                                        </label>
+                                        <div class="text-xs text-slate-500">
+                                            Rs. <?php echo number_format($item['item_price'], 2); ?> 
+                                            <span class="ml-1 text-[11px] font-bold <?php echo $isOutOfStock ? 'text-red-500' : 'text-slate-400'; ?>">
+                                                (Stock: <?php echo $stock; ?>)
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Quantity Controls (+ / -) -->
+                                <div class="flex items-center gap-1 bg-white border border-slate-200 rounded-md p-1">
+                                    <button type="button" 
+                                            onclick="changeQty(<?php echo $item['id']; ?>, -1)" 
+                                            <?php echo $isOutOfStock ? 'disabled' : ''; ?>
+                                            class="w-6 h-6 flex items-center justify-center bg-slate-100 text-slate-700 rounded hover:bg-slate-200 font-bold text-sm select-none">
+                                        -
+                                    </button>
+
+                                    <input type="number" 
+                                           name="qty[<?php echo $item['id']; ?>]" 
+                                           id="qty_<?php echo $item['id']; ?>" 
+                                           value="1" 
+                                           min="1" 
+                                           max="<?php echo $stock > 0 ? $stock : 1; ?>"
+                                           oninput="calculateAccessoriesTotal()"
+                                           <?php echo $isOutOfStock ? 'disabled' : ''; ?>
+                                           class="w-12 text-center text-sm font-bold text-slate-800 outline-none">
+
+                                    <button type="button" 
+                                            onclick="changeQty(<?php echo $item['id']; ?>, 1)" 
+                                            <?php echo $isOutOfStock ? 'disabled' : ''; ?>
+                                            class="w-6 h-6 flex items-center justify-center bg-slate-100 text-slate-700 rounded hover:bg-slate-200 font-bold text-sm select-none">
+                                        +
+                                    </button>
+                                </div>
+
+                            </div>
                         <?php endforeach; ?>
                     <?php else: ?>
-                        <option value="" disabled class="text-slate-400">Store me koi items nahi hain. Store page se add karein.</option>
+                        <div class="p-4 text-center text-xs text-slate-400">Store me koi items nahi hain. Store page se add karein.</div>
                     <?php endif; ?>
-                </select>
+                </div>
             </div>
 
             <!-- Note Field -->
@@ -216,22 +330,22 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 </div>
             </div>
 
-        <!-- Signature & Contact Section -->
-<div class="pt-6 border-t border-slate-200 flex justify-between items-end">
-    <!-- Contact Number (Left) -->
-    <div class="w-48 text-center">
-        <div class="border-b-2 border-slate-400 mb-1 h-12 flex items-end justify-center pb-1">
-            <span class="text-sm font-medium text-slate-800">0313 9158294</span>
-        </div>
-        <span class="text-xs font-semibold text-slate-600 uppercase">Contact Number</span>
-    </div>
+            <!-- Signature & Contact Section -->
+            <div class="pt-6 border-t border-slate-200 flex justify-between items-end">
+                <!-- Contact Number (Left) -->
+                <div class="w-48 text-center">
+                    <div class="border-b-2 border-slate-400 mb-1 h-12 flex items-end justify-center pb-1">
+                        <span class="text-sm font-medium text-slate-800">0313 9158294</span>
+                    </div>
+                    <span class="text-xs font-semibold text-slate-600 uppercase">Contact Number</span>
+                </div>
 
-    <!-- Authorized Signature (Right) -->
-    <div class="w-48 text-center">
-        <div class="border-b-2 border-slate-400 mb-1 h-12"></div>
-        <span class="text-xs font-semibold text-slate-600 uppercase">Authorized Signature</span>
-    </div>
-</div>
+                <!-- Authorized Signature (Right) -->
+                <div class="w-48 text-center">
+                    <div class="border-b-2 border-slate-400 mb-1 h-12"></div>
+                    <span class="text-xs font-semibold text-slate-600 uppercase">Authorized Signature</span>
+                </div>
+            </div>
 
             <!-- Submit Button -->
             <div>
